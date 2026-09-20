@@ -18,6 +18,8 @@ import java.lang.reflect.Method
 )
 object HideQmate : BaseSwitchHookItem() {
 
+    override val isNeedRestart: Boolean = true
+
     private const val API_IMPL = "com.tencent.mobileqq.qmate.api.impl.QmateApiImpl"
     private const val SERVICE_IMPL = "com.tencent.mobileqq.qmate.api.impl.QmateServiceImpl" // 9.3.65 开关下沉到此
     private const val SWITCHER = "com.tencent.mobileqq.qmate.api.QmateSwitcher" // 9.3.65 新增
