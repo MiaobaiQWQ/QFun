@@ -3,6 +3,7 @@ package me.yxp.qfun.hook.file
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.graphics.drawable.Drawable
+import android.util.Log
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -25,12 +26,15 @@ import me.yxp.qfun.utils.qq.Toasts
 import me.yxp.qfun.utils.reflect.callMethod
 import me.yxp.qfun.utils.reflect.clazz
 import me.yxp.qfun.utils.reflect.findMethodOrNull
-import me.yxp.qfun.utils.reflect.getObjectOrNull
 import java.io.File
 import java.lang.reflect.Method
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
+
+/** 收藏表情读取结果，error 非空表示读取失败的原因 */
+data class EmoticonLoadResult(val items: List<Any>, val error: String?)
 
 @HookItemAnnotation(
     "导出收藏表情",
@@ -50,7 +54,7 @@ object EmoticonExport : BaseClickableHookItem<EmoticonExportConfig>(EmoticonExpo
     private val decodeDispatcher = Dispatchers.IO.limitedParallelism(4)
 
     /** 缩略图缓存，滚动/重组时不再重复解码 */
-    private val thumbCache = java.util.concurrent.ConcurrentHashMap<String, ImageBitmap>()
+    private val thumbCache = ConcurrentHashMap<String, ImageBitmap>()
 
     /** 导出目录：Android/data/<宿主>/QFun/<QQ号>/emoticon */
     val exportDir: String get() = "${QQCurrentEnv.currentDir}emoticon"
@@ -77,132 +81,157 @@ object EmoticonExport : BaseClickableHookItem<EmoticonExportConfig>(EmoticonExpo
     override fun onHook() = Unit
 
     /** QQ 运行时真实的收藏表情列表 */
-    fun loadEmoticons(): List<Any> {
-        val api = apiMethod ?: return emptyList()
-        val utilsClass = FAV_UTILS.clazz ?: return emptyList()
+    fun loadEmoticons(): EmoticonLoadResult = try {
+        val api = apiMethod ?: error("未找到 $QROUTE.api")
+        val utilsClass = FAV_UTILS.clazz ?: error("未找到 $FAV_UTILS")
+        val method = dataMethod ?: error("未找到 $FAV_UTILS.getEmoticonData")
+        val service = api.invoke(null, utilsClass) ?: error("QRoute.api 返回 null")
+        val data = method.invoke(service)
 
-        val service = runCatching { api.invoke(null, utilsClass) }.getOrNull() ?: return emptyList()
-        val data = runCatching { dataMethod?.invoke(service) }.getOrNull()
+        val items = (data as? List<*>)?.filterNotNull()
+            ?: error("返回值不是列表：${data?.javaClass?.name}")
 
-        return (data as? List<*>)?.filterNotNull() ?: emptyList()
+        EmoticonLoadResult(items, null)
+    } catch (t: Throwable) {
+        EmoticonLoadResult(emptyList(), "${t.javaClass.simpleName}: ${t.message}")
+    }
+
+    /** 本地文件/下载地址的统计，显示在面板上方便判断导出为什么失败 */
+    fun summary(items: List<Any>): String {
+        var local = 0
+        var remote = 0
+        var none = 0
+
+        items.forEach { item ->
+            val path = item.field("path")
+            val url = item.field("url")
+            val file = path?.let { File(it) }
+
+            when {
+                file != null && file.exists() && file.length() > 0L -> local++
+                !url.isNullOrBlank() -> remote++
+                else -> none++
+            }
+        }
+
+        return "本地已有 $local 个，需要下载 $remote 个，无地址 $none 个"
     }
 
     /** 列表里展示用的缩略图：优先解本地文件，取不到再问 QQ 要 drawable */
-    suspend fun thumbnail(context: Context, item: Any): ImageBitmap? {
+    suspend fun thumbnail(context: Context, item: Any): ImageBitmap? = try {
         val id = idOf(item)
 
-        thumbCache[id]?.let { return it }
-
-        val bitmap = withContext(decodeDispatcher) {
+        thumbCache[id] ?: withContext(decodeDispatcher) {
             decodeLocal(item) ?: fromDrawable(context, item)
+        }?.also { thumbCache[id] = it }
+    } catch (t: Throwable) {
+        report("缩略图", t)
+        null
+    }
+
+    private fun decodeLocal(item: Any): ImageBitmap? = runCatching {
+        val path = item.field("path") ?: return@runCatching null
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = max(1, minOf(bounds.outWidth, bounds.outHeight) / 96)
         }
-        if (bitmap != null) thumbCache[id] = bitmap
-        return bitmap
-    }
+        BitmapFactory.decodeFile(path, options)?.asImageBitmap()
+    }.getOrNull()
 
-    private fun decodeLocal(item: Any): ImageBitmap? {
-        val path = item.getObjectOrNull("path") as? String ?: return null
-        if (path.isBlank()) return null
-
-        return runCatching {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(path, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
-
-            val options = BitmapFactory.Options().apply {
-                inSampleSize = max(1, minOf(bounds.outWidth, bounds.outHeight) / 96)
-            }
-            BitmapFactory.decodeFile(path, options)?.asImageBitmap()
-        }.getOrNull()
-    }
-
-    private fun fromDrawable(context: Context, item: Any): ImageBitmap? {
-        val drawable = runCatching {
-            item.callMethod("getDrawable", context, 1f) as? Drawable
-        }.getOrNull()
-
-        return runCatching { drawable?.toBitmap(128, 128)?.asImageBitmap() }.getOrNull()
-    }
+    private fun fromDrawable(context: Context, item: Any): ImageBitmap? = runCatching {
+        val drawable = item.callMethod("getDrawable", context, 1f) as? Drawable
+        drawable?.toBitmap(128, 128)?.asImageBitmap()
+    }.getOrNull()
 
     /** 表情唯一标识，用于记住勾选与缓存 */
-    fun idOf(item: Any): String {
-        val eId = item.getObjectOrNull("eId") as? String
-        if (!eId.isNullOrBlank()) return eId
+    fun idOf(item: Any): String = runCatching {
+        item.field("eId") ?: item.field("emojiMd5") ?: item.hashCode().toString()
+    }.getOrDefault("unknown")
 
-        val md5 = item.getObjectOrNull("emojiMd5") as? String
-        if (!md5.isNullOrBlank()) return md5
-
-        return item.hashCode().toString()
-    }
-
-    fun nameOf(item: Any): String {
-        val name = runCatching { item.callMethod("getName") as? String }.getOrNull()
-        return name?.takeIf { it.isNotBlank() } ?: idOf(item)
-    }
+    /**
+     * path、eId、url 都声明在父类 BaseFavoriteEmoticonInfo 上，
+     * 而 getObjectOrNull 只查当前类的 declaredField，所以要自己往父类找。
+     */
+    internal fun Any.field(name: String): String? = runCatching {
+        generateSequence(this::class.java) { it.superclass }
+            .mapNotNull { clazz -> runCatching { clazz.getDeclaredField(name) }.getOrNull() }
+            .firstOrNull()
+            ?.apply { isAccessible = true }
+            ?.get(this) as? String
+    }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }?.removePrefix("file://")
 
     /**
      * 导出：本地已有文件的直接复制（快，且能保住 GIF），
-     * 其余并发下载；失败原因写入 error_log 便于排查。
+     * 其余并发下载；失败原因写日志，并把错误显示出来。
      */
     fun export(items: List<Any>) {
         if (items.isEmpty()) {
-            Toasts.qqToast(1, "没有可导出的表情")
+            toast(1, "没有可导出的表情")
             return
         }
 
         ModuleScope.launchIO(name) {
-            val dir = File(exportDir).apply { mkdirs() }
+            try {
+                val dir = File(exportDir).apply { mkdirs() }
 
-            var ok = 0
-            val pending = mutableListOf<Any>()
+                var ok = 0
+                val pending = mutableListOf<Any>()
 
-            items.forEach { item ->
-                if (copyLocal(item, dir)) ok++ else pending += item
-            }
-
-            val failures = mutableListOf<String>()
-
-            coroutineScope {
-                pending.map { item ->
-                    async(decodeDispatcher) { item to download(item, dir) }
-                }.awaitAll().forEach { (item, error) ->
-                    if (error == null) ok++ else failures += "${idOf(item)} -> $error"
+                items.forEach { item ->
+                    if (copyLocal(item, dir)) ok++ else pending += item
                 }
-            }
 
-            if (failures.isNotEmpty()) {
-                LogUtils.e(
-                    this@EmoticonExport,
-                    IllegalStateException(
-                        "收藏表情导出失败 ${failures.size} 个：\n" + failures.take(8).joinToString("\n")
-                    )
+                val failures = mutableListOf<String>()
+
+                if (pending.isNotEmpty()) {
+                    coroutineScope {
+                        pending.map { item ->
+                            async(decodeDispatcher) { item to download(item, dir) }
+                        }.awaitAll().forEach { (item, error) ->
+                            if (error == null) ok++ else failures += "${idOf(item)} -> $error"
+                        }
+                    }
+                }
+
+                if (failures.isNotEmpty()) {
+                    val detail = failures.take(8).joinToString("\n")
+                    LogUtils.d("[收藏表情] 导出失败 ${failures.size} 个：\n$detail")
+                    runCatching {
+                        LogUtils.e(
+                            this@EmoticonExport,
+                            IllegalStateException("收藏表情导出失败 ${failures.size} 个：\n$detail")
+                        )
+                    }
+                }
+
+                toast(
+                    if (failures.isEmpty()) 2 else 1,
+                    "导出完成：成功 $ok 个，失败 ${failures.size} 个\n$exportDir"
                 )
+            } catch (t: Throwable) {
+                report("导出", t)
+                toast(1, "导出出错：${t.javaClass.simpleName}: ${t.message.orEmpty().take(80)}")
             }
-
-            Toasts.qqToast(
-                if (failures.isEmpty()) 2 else 1,
-                "导出完成：成功 $ok 个，失败 ${failures.size} 个\n$exportDir"
-            )
         }
     }
 
-    private fun copyLocal(item: Any, dir: File): Boolean {
-        val path = item.getObjectOrNull("path") as? String
-        if (path.isNullOrBlank()) return false
+    private fun copyLocal(item: Any, dir: File): Boolean = runCatching {
+        val path = item.field("path") ?: return@runCatching false
 
         val source = File(path)
-        if (!source.exists() || source.length() == 0L) return false
+        if (!source.exists() || source.length() == 0L) return@runCatching false
 
-        return runCatching {
-            source.copyTo(File(dir, fileNameOf(item, path)), overwrite = true)
-            true
-        }.getOrDefault(false)
-    }
+        source.copyTo(File(dir, fileNameOf(item, path)), overwrite = true)
+        true
+    }.getOrDefault(false)
 
     /** 返回 null 表示成功，否则是失败原因 */
     private fun download(item: Any, dir: File): String? {
-        val url = item.getObjectOrNull("url") as? String
-        if (url.isNullOrBlank()) return "本地文件不存在且没有 url"
+        val url = item.field("url") ?: return "本地文件不存在且没有 url"
 
         val target = File(dir, fileNameOf(item, url))
 
@@ -248,7 +277,16 @@ object EmoticonExport : BaseClickableHookItem<EmoticonExportConfig>(EmoticonExpo
 
     private fun fileNameOf(item: Any, source: String): String {
         val ext = source.substringAfterLast('.', "").takeIf { it.length in 2..5 } ?: "png"
-        return "${idOf(item)}.$ext"
+        return "${idOf(item).replace(Regex("[^A-Za-z0-9_-]"), "_")}.$ext"
+    }
+
+    private fun toast(icon: Int, message: String) {
+        ModuleScope.launchMain { Toasts.qqToast(icon, message) }
+    }
+
+    private fun report(title: String, t: Throwable) {
+        LogUtils.d("[收藏表情] $title 出错：\n${Log.getStackTraceString(t)}")
+        runCatching { LogUtils.e(this, t) }
     }
 
     @Composable
