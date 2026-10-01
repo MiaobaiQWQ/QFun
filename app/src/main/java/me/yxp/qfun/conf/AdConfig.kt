@@ -9,6 +9,7 @@ data class AdConfig(
     companion object {
         /** 各广告位置的 key，配置页与 Hook 共用 */
         const val QZONE_FEED = "qzone_feed"
+        const val QZONE_RECOMMEND_AD = "qzone_recommend_ad"
         const val GDT_NATIVE = "gdt_native"
         const val GDT_BANNER = "gdt_banner"
         const val GDT_PRELOAD = "gdt_preload"
